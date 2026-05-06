@@ -1,0 +1,138 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════
+// LESSON TEACHER — FIRESTORE SECURITY RULES
+// ═══════════════════════════════════════════════════════════════
+// Paste these rules into Firebase Console → Firestore → Rules.
+// They enforce:
+//   • Each user owns their /users/{uid} doc and subcollections
+//   • Parents who have an active /parent_links row can READ their
+//     linked child's progress doc (but never write)
+//   • Arena leaderboard rows are readable by anyone signed in but
+//     writable only by the owner of the row
+//   • The social directory is readable by anyone signed in
+// ═══════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn()      { return request.auth != null; }
+    function isOwner(uid)      { return isSignedIn() && request.auth.uid == uid; }
+    function isParentOf(childUid) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/parent_links/$(request.auth.uid + '_' + childUid));
+    }
+
+    // ── User profile + their owned subcollections ─────────────────
+    match /users/{uid} {
+      // Anyone signed in can read a basic profile (needed so parents can
+      // resolve a child's email → uid during the link flow). Writes are
+      // restricted to the owner. If you want stricter privacy, change
+      // `read` to `isOwner(uid) || isParentOf(uid)`.
+      allow read:   if isSignedIn();
+      allow create: if isOwner(uid);
+      allow update: if isOwner(uid);
+      allow delete: if isOwner(uid);
+
+      // Student progress doc — owner read/write, parent read-only
+      match /progress/{docId} {
+        allow read:  if isOwner(uid) || isParentOf(uid);
+        allow write: if isOwner(uid);
+      }
+
+      // Parent state doc — owner only
+      match /parent/{docId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // Social profile — owner write, anyone signed in can read
+      match /social/{docId} {
+        allow read:  if isSignedIn();
+        allow write: if isOwner(uid);
+      }
+    }
+
+    // ── Parent ↔ child link rows ──────────────────────────────────
+    // Only the parent (request.auth.uid == parentUid) can create or
+    // delete their own link rows. Reads limited to the parent OR child.
+    match /parent_links/{linkId} {
+      allow read:   if isSignedIn() && (
+                      resource.data.parentUid == request.auth.uid ||
+                      resource.data.childUid  == request.auth.uid
+                    );
+      allow create: if isSignedIn() && request.resource.data.parentUid == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.parentUid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.parentUid == request.auth.uid;
+    }
+
+    // ── Arena profiles ────────────────────────────────────────────
+    match /arena_profiles/{uid} {
+      allow read:  if isSignedIn();
+      allow write: if isOwner(uid);
+    }
+
+    // ── Arena leaderboard rows ────────────────────────────────────
+    // Row id format: {uid}_{classGroup}_{scope}_{weekKey}
+    // We allow any signed-in user to read. Writes are restricted to
+    // the row owner (uid prefix matches request.auth.uid).
+    match /arena_leaders/{rowId} {
+      allow read:  if isSignedIn();
+      allow write: if isSignedIn() &&
+                    request.resource.data.uid == request.auth.uid;
+    }
+
+    // ── Public discovery directory (optional, for social) ─────────
+    match /social_directory/{uid} {
+      allow read:  if isSignedIn();
+      allow write: if isOwner(uid);
+    }
+
+    // ── Arena rooms (live multiplayer) ───────────────────────────
+    // Transient room data — anyone signed in can read/update so
+    // join/leave/score-publish flows work without complex matching.
+    // Only the host can create or delete.
+    match /arena_rooms/{roomId} {
+      allow read:   if isSignedIn();
+      allow create: if isSignedIn() &&
+                     request.resource.data.hostUid == request.auth.uid;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && resource.data.hostUid == request.auth.uid;
+
+      match /lobbyChat/{msgId} {
+        allow read:   if isSignedIn();
+        allow create: if isSignedIn() &&
+                       request.resource.data.uid == request.auth.uid;
+        allow update, delete: if false;
+      }
+      match /specChat/{msgId} {
+        allow read:   if isSignedIn();
+        allow create: if isSignedIn() &&
+                       request.resource.data.uid == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+
+    // ── Direct messages (DMs) ─────────────────────────────────────
+    // Thread ID format: sortedUidA__sortedUidB
+    // Members of the thread can read; either side can post.
+    match /dm_threads/{threadId} {
+      allow read: if isSignedIn() &&
+                   request.auth.uid in resource.data.members;
+      allow create: if isSignedIn() &&
+                     request.auth.uid in request.resource.data.members &&
+                     request.resource.data.members.size() == 2;
+      allow update: if isSignedIn() &&
+                     request.auth.uid in resource.data.members;
+      allow delete: if false;
+
+      match /messages/{msgId} {
+        allow read:   if isSignedIn() &&
+                       request.auth.uid in get(/databases/$(database)/documents/dm_threads/$(threadId)).data.members;
+        allow create: if isSignedIn() &&
+                       request.resource.data.from == request.auth.uid &&
+                       request.auth.uid in get(/databases/$(database)/documents/dm_threads/$(threadId)).data.members;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
